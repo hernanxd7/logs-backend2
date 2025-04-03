@@ -11,7 +11,7 @@ const {admin, db} = require('../config/firebase')
 
 // Inicializar Express
 const app = express();
-const PORT = 3001;
+const PORT = process.env.PORT || 3001;
 
 // Configurar middleware
 app.use(cors());
