@@ -555,6 +555,259 @@ app.get('/ping', (req, res) => {
   res.json({ message: 'Servidor 2 (sin Rate Limit) respondió correctamente', timestamp: new Date() });
 });
 
+// Endpoint para obtener estadísticas de métodos HTTP
+app.get('/logs/methods', verifyToken, async (req, res) => {
+  try {
+    console.log('Obteniendo estadísticas de métodos HTTP...');
+    
+    // Inicializar estadísticas por defecto
+    const methodStats = {
+      GET: 0,
+      POST: 0,
+      PUT: 0,
+      DELETE: 0,
+      OTHER: 0
+    };
+    
+    // Obtener logs de las últimas 24 horas
+    const oneDayAgo = new Date();
+    oneDayAgo.setDate(oneDayAgo.getDate() - 1);
+    
+    try {
+      const logsSnapshot = await db.collection('logs')
+        .where('timestamp', '>=', oneDayAgo)
+        .get();
+      
+      console.log(`Encontrados ${logsSnapshot.size} logs para analizar`);
+      
+      // Contar los métodos de las peticiones en los logs
+      logsSnapshot.forEach(doc => {
+        const logData = doc.data();
+        
+        // Extraer el método HTTP de diferentes ubicaciones posibles en la estructura
+        let method = null;
+        
+        // Caso 1: El método está directamente en el campo 'method'
+        if (logData.method) {
+          method = logData.method.toUpperCase();
+        } 
+        // Caso 2: El método está en meta.req.method (como se ve en los logs)
+        else if (logData.meta && logData.meta.req && logData.meta.req.method) {
+          method = logData.meta.req.method.toUpperCase();
+        }
+        // Caso 3: El método está en el mensaje (como "GET /logs")
+        else if (logData.message && typeof logData.message === 'string') {
+          const methodMatch = logData.message.match(/^(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD)\s+/i);
+          if (methodMatch) {
+            method = methodMatch[1].toUpperCase();
+          }
+        }
+        
+        // Incrementar el contador correspondiente
+        if (method) {
+          if (methodStats[method] !== undefined) {
+            methodStats[method]++;
+          } else {
+            methodStats.OTHER++;
+          }
+        }
+      });
+      
+      res.json(methodStats);
+    } catch (dbError) {
+      console.error('Error al consultar Firestore:', dbError);
+      res.json(methodStats); // Devolver estadísticas vacías en caso de error
+    }
+  } catch (error) {
+    console.error('Error al obtener estadísticas de métodos:', error);
+    res.status(500).json({ 
+      message: 'Error al obtener estadísticas de métodos',
+      error: error.message 
+    });
+  }
+});
+
+// Endpoint de diagnóstico para ver la estructura de los logs
+app.get('/logs/debug', verifyToken, async (req, res) => {
+  try {
+    const logsSnapshot = await db.collection('logs')
+      .limit(5)
+      .get();
+    
+    const sampleLogs = [];
+    logsSnapshot.forEach(doc => {
+      sampleLogs.push(doc.data());
+    });
+    
+    res.json({ sampleLogs });
+  } catch (error) {
+    console.error('Error al obtener logs de muestra:', error);
+    res.status(500).json({ message: 'Error al obtener logs de muestra' });
+  }
+});
+
+// Añadir estas rutas antes del inicio del servidor
+
+// Ruta para verificar si existe un usuario
+app.post('/check-user', async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ message: 'El correo electrónico es requerido' });
+    }
+    
+    // Buscar usuario por email
+    const userSnapshot = await db.collection('users')
+      .where('email', '==', email)
+      .get();
+    
+    // Registrar intento de recuperación
+    await db.collection('logs').add({
+      action: 'password_recovery_attempt',
+      email,
+      timestamp: new Date(),
+      logLevel: 'info',
+      server: 'server2'
+    });
+    
+    res.json({ exists: !userSnapshot.empty });
+  } catch (error) {
+    console.error('Error al verificar usuario:', error);
+    res.status(500).json({ message: 'Error al verificar usuario' });
+  }
+});
+
+// Ruta para verificar MFA en recuperación
+app.post('/verify-recovery-mfa', async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    
+    if (!email || !otp) {
+      return res.status(400).json({ message: 'Email y código OTP son requeridos' });
+    }
+    
+    // Buscar usuario por email
+    const userSnapshot = await db.collection('users')
+      .where('email', '==', email)
+      .get();
+    
+    if (userSnapshot.empty) {
+      return res.status(400).json({ message: 'Usuario no encontrado' });
+    }
+    
+    const userDoc = userSnapshot.docs[0];
+    const userData = userDoc.data();
+    
+    // Determinar qué secreto usar (secret del servidor 2 o mfaSecret del servidor 1)
+    const secretToUse = userData.secret || userData.mfaSecret;
+    
+    if (!secretToUse) {
+      return res.status(400).json({ 
+        message: 'Este usuario no tiene 2FA configurado, no se puede recuperar la contraseña por este método' 
+      });
+    }
+    
+    // Verificar código OTP
+    const verified = speakeasy.totp.verify({
+      secret: secretToUse,
+      encoding: 'base32',
+      token: otp,
+      window: 1
+    });
+    
+    if (verified) {
+      // Registrar verificación exitosa
+      await db.collection('logs').add({
+        action: 'recovery_mfa_success',
+        userId: userDoc.id,
+        timestamp: new Date(),
+        logLevel: 'info',
+        server: 'server2'
+      });
+      
+      return res.json({ success: true });
+    } else {
+      // Registrar verificación fallida
+      await db.collection('logs').add({
+        action: 'recovery_mfa_failed',
+        userId: userDoc.id,
+        timestamp: new Date(),
+        logLevel: 'warn',
+        server: 'server2'
+      });
+      
+      return res.json({ success: false });
+    }
+  } catch (error) {
+    console.error('Error en verificación MFA para recuperación:', error);
+    res.status(500).json({ message: 'Error en verificación MFA' });
+  }
+});
+
+// Ruta para restablecer contraseña
+app.post('/reset-password', async (req, res) => {
+  try {
+    const { email, otp, newPassword } = req.body;
+    
+    if (!email || !otp || !newPassword) {
+      return res.status(400).json({ 
+        message: 'Email, código OTP y nueva contraseña son requeridos' 
+      });
+    }
+    
+    // Buscar usuario por email
+    const userSnapshot = await db.collection('users')
+      .where('email', '==', email)
+      .get();
+    
+    if (userSnapshot.empty) {
+      return res.status(400).json({ message: 'Usuario no encontrado' });
+    }
+    
+    const userDoc = userSnapshot.docs[0];
+    const userData = userDoc.data();
+    
+    // Determinar qué secreto usar
+    const secretToUse = userData.secret || userData.mfaSecret;
+    
+    // Verificar código OTP nuevamente por seguridad
+    const verified = speakeasy.totp.verify({
+      secret: secretToUse,
+      encoding: 'base32',
+      token: otp,
+      window: 1
+    });
+    
+    if (!verified) {
+      return res.status(400).json({ message: 'Código de verificación inválido' });
+    }
+    
+    // Generar hash de la nueva contraseña
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    
+    // Actualizar contraseña en la base de datos
+    await db.collection('users').doc(userDoc.id).update({
+      password: hashedPassword
+    });
+    
+    // Registrar cambio de contraseña
+    await db.collection('logs').add({
+      action: 'password_reset_success',
+      userId: userDoc.id,
+      timestamp: new Date(),
+      logLevel: 'info',
+      server: 'server2'
+    });
+    
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error al restablecer contraseña:', error);
+    res.status(500).json({ message: 'Error al restablecer contraseña' });
+  }
+});
+
 // Iniciar servidor
 app.listen(PORT, () => {
   console.log(`Servidor 2 (sin Rate Limit) ejecutándose en http://localhost:${PORT}`);
